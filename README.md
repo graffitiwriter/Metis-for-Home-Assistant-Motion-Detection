@@ -209,7 +209,7 @@ source venv/bin/activate
 
 With this setup on Metis Compute Board (single Metis AIPU):
 - 2 cameras @ 1080p
-- YOLOv8s model
+- YOLOv26s model
 - ~30 FPS combined throughput
 - ~196ms latency
 - Low CPU usage (AI offloaded to Metis AIPU)
