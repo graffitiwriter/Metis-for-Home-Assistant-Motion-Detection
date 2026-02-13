@@ -1,0 +1,308 @@
+#!/usr/bin/env python
+# Home Assistant Integration for Metis Object Detection
+# Monitors RTSP cameras, checks detections against defined zones, 
+# and triggers Home Assistant automations/notifications via webhooks,
+# all handled locally.
+
+import cv2
+import numpy as np
+import requests
+import time
+from collections import defaultdict
+
+from axelera.app import config, display, logging_utils
+from axelera.app.stream import create_inference_stream
+
+# ============================================================================
+# CONFIGURATION: Customise these values for your setup
+# ============================================================================
+
+# Home Assistant settings
+HA_IP = "192.168.1.100"  # REPLACE: Your Home Assistant IP address
+HA_PORT = "8123"  # Default Home Assistant port
+FRONT_WEBHOOK = f"http://{HA_IP}:{HA_PORT}/api/webhook/metis_front_door"
+BACK_WEBHOOK = f"http://{HA_IP}:{HA_PORT}/api/webhook/metis_back_door"
+
+# Camera RTSP URLs
+# Format: rtsp://username:password@ip:port/path
+# You'll need to find the actual RTSP format for your specific make and model of camera. Below are just examples.
+FRONT_CAMERA = "rtsp://admin:PASSWORD@192.168.1.10:554/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif"
+BACK_CAMERA = "rtsp://admin:PASSWORD@192.168.1.11:554/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif"
+
+# Detection settings
+FRONT_DETECT_CLASSES = ["person", "cat", "dog", "car"]  # Objects to detect on front camera
+BACK_DETECT_CLASSES = ["person", "cat", "dog"]  # Objects to detect on back camera
+CONFIDENCE_THRESHOLD = 0.5  # Minimum confidence to trigger (0.0 to 1.0)
+PARKING_DURATION = 4.0  # Seconds car must be stationary in BLUE zone
+MOVEMENT_THRESHOLD = 30.0  # Pixels - if car moves more than this, it's not parked
+ALERT_COOLDOWN = 10.0  # Seconds between repeated alerts for same object
+
+# ============================================================================
+# ZONE DEFINITIONS
+# Define detection zones as polygons using pixel coordinates
+# Coordinate system: (0,0) is top-left, (1920,1080) is bottom-right for 1080p
+# Measure zones using image editor (Photoshop, GIMP, etc) on camera screenshot
+# ============================================================================
+
+# Front camera zones (adjust these for your camera angle and layout)
+# RED ZONE: Immediate alerts when ANY part of object enters this zone
+FRONT_RED_ZONE = np.array([
+    [0, 1080],     # Bottom left corner
+    [0, 433],      # Top left (adjust based on your fence/boundary line)
+    [1920, 433],   # Top right
+    [1920, 1080]   # Bottom right corner
+], np.int32)
+
+# BLUE ZONE: Detect STATIONARY cars only (optional - comment out if not needed)
+FRONT_BLUE_ZONE = np.array([
+    [0, 383],      # Top left
+    [1300, 383],   # Top right (adjust to exclude unwanted areas)
+    [1300, 433],   # Bottom right (sits immediately above RED zone)
+    [0, 433]       # Bottom left
+], np.int32)
+
+# Global state for tracking
+last_alert_time = defaultdict(float)
+blue_zone_cars = {}  # Tracks cars in BLUE zone for parking detection only
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def is_point_in_zone(point, zone_polygon):
+    """
+    Check if a point is inside a polygon zone using OpenCV.
+    Uses cv2.pointPolygonTest for accurate point-in-polygon testing.
+    """
+    result = cv2.pointPolygonTest(zone_polygon, point, False)
+    return result >= 0
+
+def is_box_overlapping_zone(bbox, zone_polygon):
+    """
+    Check if ANY part of a bounding box overlaps with a zone.
+    Checks all 4 corners plus center point - triggers when even a foot crosses the line.
+    
+    Args:
+        bbox: Bounding box as [x1, y1, x2, y2]
+        zone_polygon: NumPy array of polygon vertices
+    
+    Returns:
+        Boolean - True if any part of box touches the zone
+    """
+    x1, y1, x2, y2 = bbox
+    # Check all 4 corners plus center point
+    points_to_check = [
+        (x1, y1),                        # top-left corner
+        (x2, y1),                        # top-right corner
+        (x1, y2),                        # bottom-left corner
+        (x2, y2),                        # bottom-right corner
+        ((x1+x2)//2, (y1+y2)//2),       # center point
+    ]
+    return any(is_point_in_zone(point, zone_polygon) for point in points_to_check)
+
+def send_webhook(webhook_url, object_class, confidence, camera_name):
+    """
+    Send detection event to Home Assistant via HTTP POST.
+    Sends JSON payload with object class and confidence score.
+    """
+    payload = {"object": object_class, "confidence": float(confidence)}
+    try:
+        response = requests.post(webhook_url, json=payload, timeout=2)
+        if response.status_code == 200:
+            print(f"✓ Alert: {object_class} on {camera_name} (conf: {confidence:.2f})")
+        else:
+            print(f"⚠ Webhook failed ({response.status_code}): {object_class} on {camera_name}")
+    except requests.exceptions.RequestException as e:
+        print(f"⚠ Webhook error: {e}")
+
+def should_send_alert(camera_name, object_class, bbox=None):
+    """
+    Check if enough time has passed since last alert to prevent spam notifications.
+    Tracks individual objects by position - different objects trigger new alerts,
+    but the same object in the same location respects the cooldown period.
+    
+    Args:
+        camera_name: Name of the camera
+        object_class: Type of object (person, car, etc)
+        bbox: Optional bounding box [x1,y1,x2,y2] for position-based tracking
+    
+    Returns:
+        Boolean - True if enough time has passed to send new alert
+    """
+    if bbox:
+        # Track individual objects by their approximate position (100px grid)
+        obj_pos = f"{int(bbox[0]/100)}_{int(bbox[1]/100)}"
+        key = (camera_name, object_class, obj_pos)
+    else:
+        # Fallback to type-based tracking
+        key = (camera_name, object_class, "all")
+    
+    current_time = time.time()
+    if current_time - last_alert_time[key] >= ALERT_COOLDOWN:
+        last_alert_time[key] = current_time
+        return True
+    return False
+
+def process_front_camera(detections):
+    """
+    Process detections from front camera with zone-based logic.
+    
+    - RED ZONE: Triggers immediately when any part of object enters. Lets you mask areas outside your property.
+    - BLUE ZONE (optional): Tracks cars for parking detection
+      Only alerts if car is stationary for PARKING_DURATION seconds
+    """
+    current_time = time.time()
+    cars_in_blue = set()
+    
+    for detection in detections:
+        # Get detection properties from Voyager SDK
+        class_name = detection.label.name  # Object class (person, car, etc)
+        confidence = detection.score  # Detection confidence (0.0 to 1.0)
+        
+        # Filter by class and confidence threshold
+        if class_name not in FRONT_DETECT_CLASSES or confidence < CONFIDENCE_THRESHOLD:
+            continue
+        
+        # Extract bounding box coordinates from numpy array
+        bbox = detection.box  # Returns numpy array [x1, y1, x2, y2]
+        x1, y1, x2, y2 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+        bbox_list = [x1, y1, x2, y2]
+        
+        # Check RED ZONE - immediate alerts for all configured object types
+        if is_box_overlapping_zone(bbox_list, FRONT_RED_ZONE):
+            if should_send_alert("front_door", class_name, bbox_list):
+                send_webhook(FRONT_WEBHOOK, class_name, confidence, "Front Door")
+        
+        # Check BLUE ZONE - parking detection for cars only
+        # Tracks car position to distinguish stationary vs slow-moving vehicles
+        elif class_name == "car" and is_box_overlapping_zone(bbox_list, FRONT_BLUE_ZONE):
+            # Calculate center position of car for movement tracking
+            current_position = (int((x1+x2)/2), int((y1+y2)/2))
+            
+            # Create stable car ID based on position (100px grid)
+            car_id = f"{int(x1/100)}_{int(y1/100)}"
+            cars_in_blue.add(car_id)
+            
+            if car_id not in blue_zone_cars:
+                # First time seeing this car in blue zone - start timer
+                blue_zone_cars[car_id] = {
+                    'first_seen': current_time,
+                    'last_position': current_position,
+                    'last_update': current_time
+                }
+            else:
+                # Car seen before - check if it's moved
+                old_position = blue_zone_cars[car_id]['last_position']
+                distance_moved = (
+                    (current_position[0] - old_position[0])**2 + 
+                    (current_position[1] - old_position[1])**2
+                )**0.5
+                
+                if distance_moved > MOVEMENT_THRESHOLD:
+                    # Car moved significantly - reset parking timer
+                    blue_zone_cars[car_id] = {
+                        'first_seen': current_time,
+                        'last_position': current_position,
+                        'last_update': current_time
+                    }
+                else:
+                    # Car hasn't moved much - update position and check duration
+                    blue_zone_cars[car_id]['last_position'] = current_position
+                    blue_zone_cars[car_id]['last_update'] = current_time
+                    
+                    duration = current_time - blue_zone_cars[car_id]['first_seen']
+                    
+                    # Alert if car has been stationary long enough
+                    if duration >= PARKING_DURATION:
+                        if should_send_alert("front_door", "parked_car", bbox_list):
+                            send_webhook(FRONT_WEBHOOK, "car (parked)", confidence, "Front Door")
+    
+    # Clean up cars that left blue zone
+    cars_to_remove = set(blue_zone_cars.keys()) - cars_in_blue
+    for car_id in cars_to_remove:
+        del blue_zone_cars[car_id]
+
+def process_back_camera(detections):
+    """
+    Process detections from back camera.
+    Simpler than front camera - no zones, just detect configured object types.
+    """
+    for detection in detections:
+        class_name = detection.label.name
+        confidence = detection.score
+        
+        # Filter by class and confidence
+        if class_name not in BACK_DETECT_CLASSES or confidence < CONFIDENCE_THRESHOLD:
+            continue
+        
+        # Get bbox for position-based alert tracking
+        bbox = detection.box
+        bbox_list = [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])]
+        
+        if should_send_alert("back_door", class_name, bbox_list):
+            send_webhook(BACK_WEBHOOK, class_name, confidence, "Back Door")
+
+# ============================================================================
+# MAIN DETECTION LOOP
+# ============================================================================
+
+def main(window, stream):
+    """
+    Main inference loop - processes detections from both cameras.
+    stream_id 0 = first camera in sources list (front)
+    stream_id 1 = second camera in sources list (back)
+    """
+    window.options(0, title="Front Door")
+    window.options(1, title="Back Door")
+    
+    print("=" * 70)
+    print("Metis Home Assistant Detector - Running")
+    print("=" * 70)
+    print(f"Front camera: {FRONT_CAMERA[:50]}...")
+    print(f"Back camera:  {BACK_CAMERA[:50]}...")
+    print(f"Home Assistant: {HA_IP}:{HA_PORT}")
+    print(f"RED zone: y=433→1080 (driveway, 647px high)")
+    print(f"BLUE zone: x=0→1300, y=383→433 (road strip, 50px high)")
+    print("=" * 70)
+    
+    for frame_result in stream:
+        # Process detections based on camera (stream_id)
+        if frame_result.stream_id == 0:
+            # Front camera - zone-based detection
+            process_front_camera(frame_result.detections)
+        elif frame_result.stream_id == 1:
+            # Back camera - simple detection
+            process_back_camera(frame_result.detections)
+
+# ============================================================================
+# STARTUP
+# ============================================================================
+
+if __name__ == "__main__":
+    # Set environment variables for low latency mode
+    # These match the flags you'd use with inference.py
+    import os
+    os.environ['AXELERA_LOW_LATENCY'] = '1'
+    os.environ['AXELERA_STREAM_QUEUE_SIZE'] = '1'
+    
+    # Create inference stream with both cameras
+    # Uses official Voyager SDK create_inference_stream() API
+    stream = create_inference_stream(
+        network="yolov8s-coco",  # Model from Axelera Model Zoo
+        sources=[FRONT_CAMERA, BACK_CAMERA],  # Add more cameras by extending this list
+        pipe_type='gst',  # Use GStreamer pipeline (recommended)
+        rtsp_latency=1,  # Minimize RTSP buffering for low latency
+        aipu_cores=4,  # Use all 4 AIPU cores
+    )
+    
+    # Run headless (no display window) - suitable for SSH/service operation
+    with display.App(
+        visible=False,  # Set to True if you want to see video output
+        opengl=False,
+        buffering=False,
+    ) as app:
+        wnd = app.create_window("Metis HA Detector", (1280, 720))
+        app.start_thread(main, (wnd, stream), name='InferenceThread')
+        app.run()
+    
+    stream.stop()
