@@ -1,0 +1,195 @@
+# ==============================================================================
+# HOME ASSISTANT WEBHOOK AUTOMATIONS FOR METIS DETECTION
+# Place these in your Home Assistant automations
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# FRONT DOOR DETECTION AUTOMATION
+# ------------------------------------------------------------------------------
+alias: Metis Front Door Detection
+description: MCB webhook - always saves high-res snapshot, conditionally notifies
+
+triggers:
+  - trigger: webhook
+    webhook_id: metis_front_door  # URL endpoint: /api/webhook/metis_front_door
+    allowed_methods:
+      - POST  # Only accept POST requests (MCB sends JSON data)
+    local_only: true  # Only accept requests from local network (more secure)
+
+conditions: []  # No conditions - process all webhook triggers
+
+actions:
+  # ==============================================================================
+  # ALWAYS SAVE HIGH-RES SNAPSHOT using ffmpeg from RTSP stream
+  # This happens for every detection, regardless of notification settings
+  # ==============================================================================
+  
+  # DELAY: Give person/object time to fully enter camera view
+  # MCB detects edge of object first - this delay ensures better snapshot
+  - delay:
+      seconds: 1  # ADJUST: Increase if snapshots are too early, decrease if too late
+  
+  # VARIABLES: Store timestamp once so all file operations use same time
+  # This prevents filename mismatches between snapshot and notification
+  - variables:
+      snapshot_time: "{{ now().strftime('%Y%m%d_%H%M%S') }}"  # Format: 20260212_140645
+      snapshot_path: "/config/www/snapshots/front_{{ snapshot_time }}.jpg"  # Full filesystem path
+      snapshot_url: "/local/snapshots/front_{{ snapshot_time }}.jpg"  # Relative URL (works locally and via cloud)
+  
+  # SNAPSHOT: Grab high-res frame from RTSP stream using ffmpeg shell command
+  # Defined in configuration.yaml under shell_command:
+  - action: shell_command.snapshot_front
+    data:
+      filename: "{{ snapshot_path }}"
+  
+  # DELAY: Wait for ffmpeg to finish saving snapshot to disk
+  - delay:
+      milliseconds: 1500  # 1.5 seconds - ffmpeg needs time to grab frame and save
+  
+  # ==============================================================================
+  # CONDITIONAL NOTIFICATIONS - only if user has toggle enabled
+  # ==============================================================================
+  
+  # ------------------------------------------------------------------------------
+  # FIRST USER NOTIFICATION
+  # Duplicate this entire if/then block for each user who wants notifications
+  # ------------------------------------------------------------------------------
+  - if:
+      # Check if this user has notifications enabled via toggle helper
+      - condition: state
+        entity_id: input_boolean.user1_front_cam_notifications  # REPLACE: Your input_boolean helper
+        state: "on"
+    then:
+      # Send notification with snapshot
+      - action: notify.mobile_app_user1_phone  # REPLACE: Your mobile notification service
+        data:
+          title: Motion Detected
+          message: "{{ trigger.json.object | title }} detected at Front Door"  # e.g., "Person detected at Front Door"
+          data:
+            priority: high  # Android: Makes notification pop up immediately
+            ttl: 0  # Android: Don't expire the notification
+            image: "{{ snapshot_url }}"  # Embed snapshot in notification
+            clickAction: "{{ snapshot_url }}"  # Tap notification to view full-screen image
+            tag: metis-front-door  # Groups notifications from same camera
+  
+  # ------------------------------------------------------------------------------
+  # SECOND USER NOTIFICATION (Optional - remove if not needed)
+  # Reuses same snapshot from above to avoid taking it twice
+  # ------------------------------------------------------------------------------
+  - if:
+      - condition: state
+        entity_id: input_boolean.user2_front_cam_notifications  # REPLACE: Second user's toggle
+        state: "on"
+    then:
+      - action: notify.mobile_app_user2_phone  # REPLACE: Second user's notification service
+        data:
+          title: Motion Detected
+          message: "{{ trigger.json.object | title }} detected at Front Door"
+          data:
+            priority: high
+            ttl: 0
+            image: "{{ snapshot_url }}"  # Uses same snapshot variable
+            clickAction: "{{ snapshot_url }}"
+            tag: metis-front-door
+
+mode: single  # Prevents automation from running multiple times simultaneously
+
+
+# ------------------------------------------------------------------------------
+# BACK DOOR DETECTION AUTOMATION
+# ------------------------------------------------------------------------------
+alias: Metis Back Door Detection
+description: MCB webhook - always saves high-res snapshot, conditionally notifies
+
+triggers:
+  - trigger: webhook
+    webhook_id: metis_back_door  # URL endpoint: /api/webhook/metis_back_door
+    allowed_methods:
+      - POST
+    local_only: true
+
+conditions: []
+
+actions:
+  # ==============================================================================
+  # ALWAYS SAVE HIGH-RES SNAPSHOT
+  # ==============================================================================
+  
+  # DELAY: Give person/object time to fully enter camera view
+  - delay:
+      seconds: 1
+  
+  # VARIABLES: Store timestamp for consistent filename
+  - variables:
+      snapshot_time: "{{ now().strftime('%Y%m%d_%H%M%S') }}"
+      snapshot_path: "/config/www/snapshots/back_{{ snapshot_time }}.jpg"
+      snapshot_url: "/local/snapshots/back_{{ snapshot_time }}.jpg"
+  
+  # SNAPSHOT: Grab high-res frame from RTSP stream
+  - action: shell_command.snapshot_back
+    data:
+      filename: "{{ snapshot_path }}"
+  
+  # DELAY: Wait for ffmpeg to finish saving
+  - delay:
+      milliseconds: 1500
+  
+  # ==============================================================================
+  # CONDITIONAL NOTIFICATIONS
+  # ==============================================================================
+  
+  # First user notification
+  - if:
+      - condition: state
+        entity_id: input_boolean.user1_back_cam_notifications  # REPLACE: Your toggle
+        state: "on"
+    then:
+      - action: notify.mobile_app_user1_phone  # REPLACE: Your notification service
+        data:
+          title: Motion Detected
+          message: "{{ trigger.json.object | title }} detected at Back Door"
+          data:
+            priority: high
+            ttl: 0
+            image: "{{ snapshot_url }}"
+            clickAction: "{{ snapshot_url }}"
+            tag: metis-back-door
+  
+  # Second user notification (optional)
+  - if:
+      - condition: state
+        entity_id: input_boolean.user2_back_cam_notifications  # REPLACE: Second user's toggle
+        state: "on"
+    then:
+      - action: notify.mobile_app_user2_phone  # REPLACE: Second user's notification service
+        data:
+          title: Motion Detected
+          message: "{{ trigger.json.object | title }} detected at Back Door"
+          data:
+            priority: high
+            ttl: 0
+            image: "{{ snapshot_url }}"
+            clickAction: "{{ snapshot_url }}"
+            tag: metis-back-door
+
+mode: single
+
+
+# ------------------------------------------------------------------------------
+# SNAPSHOT CLEANUP AUTOMATION
+# Automatically deletes snapshots older than 21 days
+# ------------------------------------------------------------------------------
+alias: Cleanup Old Metis Snapshots
+description: Delete snapshots older than 21 days to save disk space
+
+triggers:
+  - trigger: time
+    at: "03:00:00"  # ADJUST: Change to your preferred cleanup time (runs daily)
+
+conditions: []
+
+actions:
+  # Execute cleanup shell command (defined in configuration.yaml)
+  - action: shell_command.cleanup_snapshots
+
+mode: single
