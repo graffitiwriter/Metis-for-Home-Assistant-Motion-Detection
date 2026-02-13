@@ -288,7 +288,7 @@ if __name__ == "__main__":
     # Create inference stream with both cameras
     # Uses official Voyager SDK create_inference_stream() API
     stream = create_inference_stream(
-        network="yolov8s-coco",  # Model from Axelera Model Zoo
+        network="yolo26s-coco-onnx",  # Model from Axelera Model Zoo
         sources=[FRONT_CAMERA, BACK_CAMERA],  # Add more cameras by extending this list
         pipe_type='gst',  # Use GStreamer pipeline (recommended)
         rtsp_latency=1,  # Minimize RTSP buffering for low latency
