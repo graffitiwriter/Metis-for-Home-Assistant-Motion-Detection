@@ -1,225 +1,126 @@
-# Metis-for-Home-Assistant-Motion-Detection
-As an experiment, I set up an Axelera AI Metis Compute Board to detect specific kinds of motion on my CCTV cameras, and send those detections to Home Assistant to trigger audomations and notifications.
+# Metis + Home Assistant CCTV Detection
 
-# Metis Home Assistant Integration
+Uses an [Axelera AI Metis](https://store.axelera.ai) device to run YOLO object detection on RTSP camera streams, with polygon zone filtering and webhook integration into [Home Assistant](https://www.home-assistant.io/) for notifications and snapshots.
 
-Real-time object and motion detection with Axelera Metis hardware, triggering Home Assistant automations and notifications via webhooks. Detects people, vehicles, and animals in user-defined zones and sends instant notifications with snapshots to your phone.
+The Metis hardware handles all the AI inference. Home Assistant handles notifications, snapshots, and automations. The two talk via webhooks over the local network.
 
-## What This Does
+**Full write-up with step-by-step instructions:**
+[Home Assistant CCTV Object and Motion Detection Using Metis](https://community.axelera.ai/the-axelera-forum-52/home-assistant-cctv-object-and-motion-detection-using-metis-1226)
 
-- Monitors RTSP camera streams using Axelera Metis AIPU
-- Detects objects in customisable zones (e.g., driveway vs road)
-- Sends webhooks to Home Assistant when objects enter zones
-- Home Assistant captures snapshots and sends phone notifications
-- Runs completely headless (no monitor required)
-- Auto-starts on boot and recovers from crashes
+## What it does
 
-## Prerequisites
+- Runs YOLO26s on the Metis AIPU across multiple RTSP cameras simultaneously
+- Filters detections through polygon zones (only alert when something crosses your property line, ignore the pavement)
+- Sends webhook events to Home Assistant when a detection matches
+- HA grabs a high-res snapshot from the camera and sends a notification to your phone
+- Parked car detection in a secondary zone (car must be stationary for a configurable number of seconds before triggering)
+- Automatic RTSP reconnection if a camera stream drops
+- Heartbeat webhook so HA can monitor whether the detector is running
+- Runs headless, auto-starts on boot, with a watchdog that recovers from hardware hangs
 
-- Metis Compute Board (or Metis M.2/PCIe card) with Voyager SDK 1.5+ installed
-- Home Assistant with mobile app configured
-- RTSP cameras accessible on local network
-- Basic familiarity with SSH and Python
+## What you need
 
-## Quick Start
+- A Metis device (Compute Board, M.2, or PCIe card)
+- [Voyager SDK](https://github.com/axelera-ai-hub/voyager-sdk) 1.5+ installed and working
+- Home Assistant with the mobile app configured for notifications
+- RTSP cameras on your local network
+- SSH access to your Metis device
 
-### 1. Home Assistant Setup
+## Files
 
-Create input_boolean helpers for notification toggles:
-- Settings > Devices & Services > Helpers > Create Helper > Toggle
-- Create one per user per camera (e.g., `user1_front_cam_notifications`)
+| File | What it is |
+|------|-----------|
+| `metis_ha_detector.py` | The detection script. Runs inside the Voyager SDK environment on the Metis device. |
+| `config.json.example` | Example configuration. Copy to `config.json` and fill in your details. |
+| `HA Configuration.yaml for Metis` | Shell commands to add to your Home Assistant `configuration.yaml` for high-res snapshots. |
+| `HA-Automations-YAML` | Home Assistant webhook automations that receive detection events and send notifications. |
 
-Add shell commands to `configuration.yaml`:
-- Copy contents from `configuration_snippet.yaml`
-- Update RTSP URLs with your camera credentials
-- Developer Tools > YAML > Restart > Shell Commands
+## Setup
 
-Import automations:
-- Settings > Automations & Scenes > ⋮ > Import
-- Import `home_assistant_automations.yaml`
-- Edit and replace all REPLACE: placeholders
+### 1. Configure Home Assistant
 
-### 2. Metis Setup
+Add the shell commands from `HA Configuration.yaml for Metis` to your Home Assistant `configuration.yaml`. These let HA grab high-res snapshots from your cameras via ffmpeg.
 
-SSH into your Metis device and enter the Voyager SDK environment:
+Create the webhook automations from `HA-Automations-YAML`. Each camera gets its own automation triggered by a webhook ID. The automations wait briefly (so the person is properly in frame), grab a snapshot, then send a notification.
+
+Create toggle helpers in HA (Settings > Helpers > Toggle) for each camera/user combination so you can enable or disable notifications without restarting anything.
+
+### 2. Configure the detection script
+
+Copy `config.json.example` to `config.json` and update:
+
+- **home_assistant.ip**: Your Home Assistant IP address
+- **cameras**: Your RTSP URLs with credentials
+- **zones**: Your zone polygon coordinates (see below)
+- **alerts**: Cooldown timing, parking duration threshold
+
+### 3. Set up your zones
+
+Zones are polygons defined as lists of [x, y] pixel coordinates for a 1920x1080 frame.
+
+To measure your zones:
+1. Take a screenshot from your camera (open the RTSP stream in VLC and snapshot it)
+2. Open it in an image editor
+3. Note the pixel coordinates of your property boundary
+
+The config has two zone types:
+- **front_red**: Your property. Any detection here triggers an alert.
+- **front_blue**: A road strip. Only triggers for cars that stay stationary (parked).
+
+The back camera has no zones. It alerts on any detection, controlled by notification toggles in HA.
+
+### 4. Download the precompiled model
+
+Inside the Voyager SDK environment:
 
 ```bash
-ssh root@YOUR_MCB_IP
-cd /home/antelao  # Or your working directory
-docker exec -it Voyager-SDK /bin/bash
-cd /home/ubuntu/voyager-sdk
-source venv/bin/activate
+axdownloadmodel yolo26s-coco-onnx
 ```
 
-Download and configure the detection script:
-
-```bash
-wget https://raw.githubusercontent.com/YOUR_REPO/metis_ha_detector.py
-nano metis_ha_detector.py
-```
-
-Update these values:
-- `HA_IP` - Your Home Assistant IP address
-- `FRONT_CAMERA` / `BACK_CAMERA` - Your RTSP URLs with credentials
-- `FRONT_RED_ZONE` / `FRONT_BLUE_ZONE` - Zone coordinates for your camera angle
-
-### 3. Test Run
+### 5. Run it
 
 ```bash
 python3 metis_ha_detector.py
 ```
 
-Walk in front of cameras to test. You should see:
-- Detection alerts printed to console
-- Home Assistant notifications on your phone
-- Snapshots saved to /config/www/snapshots/
+Walk in front of a camera to confirm detections appear in the terminal and notifications arrive on your phone.
 
-Press Ctrl+C to stop.
+### 6. Make it permanent (Metis Compute Board)
 
-### 4. Make It Permanent (Auto-start on Boot)
+On the MCB host (not inside Docker), create a startup script and systemd service so the detector starts automatically on boot. A watchdog timer checks every 2 minutes and recovers if the detector crashes. See the [full write-up](https://community.axelera.ai/the-axelera-forum-52/home-assistant-cctv-object-and-motion-detection-using-metis-1226) for details.
 
-Exit Docker container and create systemd service:
+## How it works
 
-```bash
-exit  # Exit Docker container
-
-cat > /etc/systemd/system/metis-ha-detector.service << 'EOF'
-[Unit]
-Description=Metis Home Assistant Detector
-After=network.target docker.service
-Requires=docker.service
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/home/antelao
-ExecStart=/usr/bin/docker exec -i Voyager-SDK /bin/bash -c "cd /home/ubuntu/voyager-sdk && source venv/bin/activate && AXELERA_LOW_LATENCY=1 AXELERA_STREAM_QUEUE_SIZE=1 python3 -u metis_ha_detector.py"
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-EOF
-```
-
-Make Docker container auto-start:
-
-```bash
-docker update --restart=unless-stopped Voyager-SDK
-```
-
-Enable and start the service:
-
-```bash
-systemctl daemon-reload
-systemctl enable metis-ha-detector.service
-systemctl start metis-ha-detector.service
-```
-
-Check it's running:
-
-```bash
-systemctl status metis-ha-detector.service
-```
-
-## Zone Configuration
-
-Zones are defined as polygons using pixel coordinates. For a 1920x1080 camera:
-- (0, 0) is top-left corner
-- (1920, 1080) is bottom-right corner
-
-To measure your zones:
-1. Take a screenshot from your camera
-2. Open in image editor (Photoshop, GIMP, etc)
-3. Note pixel coordinates of zone boundaries
-4. Update `FRONT_RED_ZONE` and `FRONT_BLUE_ZONE` in the script
-
-Example zones:
-- RED ZONE: Driveway/garden area - immediate alerts
-- BLUE ZONE: Road/parking area - stationary vehicle detection only
-
-## Adding More Cameras
-
-To add a third camera:
-
-1. Add RTSP URL to sources list:
-```python
-stream = create_inference_stream(
-    sources=[FRONT_CAMERA, BACK_CAMERA, THIRD_CAMERA],  # Add here
-    ...
-)
-```
-
-2. Create new webhook in Home Assistant (copy existing automation, change webhook_id)
-
-3. Add processing function:
-```python
-def process_third_camera(detections):
-    # Your detection logic here
-    ...
-
-# In main() function:
-elif frame_result.stream_id == 2:  # Third camera
-    process_third_camera(frame_result.detections)
-```
-
-## Troubleshooting
-
-**Script crashes with AttributeError**
-- Check Voyager SDK version (requires 1.5+)
-- Verify you're using correct attributes (`.score` not `.confidence`, `.box` not `.x1/.y1`)
-
-**No notifications**
-- Test webhook with curl: `curl -X POST -H "Content-Type: application/json" -d '{"object":"person","confidence":0.95}' http://YOUR_HA_IP:8123/api/webhook/metis_front_door`
-- Check input_boolean toggles are ON in Home Assistant
-- Verify MCB can reach Home Assistant IP
-
-**Wrong zones triggering**
-- Add debug print statements to see detection coordinates
-- Adjust zone boundaries based on actual detections
-- Test with `visible=True` in display.App() to see visual output
-
-**Service won't start**
-- Check Docker container is running: `docker ps | grep Voyager`
-- View service logs: `journalctl -u metis-ha-detector -n 50`
-- Verify script path in ExecStart matches your setup
-
-## Useful Commands
-
-```bash
-# View live detection logs
-journalctl -u metis-ha-detector -f
-
-# Restart the service
-systemctl restart metis-ha-detector.service
-
-# Stop the service
-systemctl stop metis-ha-detector.service
-
-# Check service status
-systemctl status metis-ha-detector.service
-
-# Enter Docker container manually
-docker exec -it Voyager-SDK /bin/bash
-cd /home/ubuntu/voyager-sdk
-source venv/bin/activate
-```
+1. The Voyager SDK pulls frames from RTSP cameras via GStreamer
+2. YOLO26s runs on the Metis AIPU, returning bounding boxes, class labels, and confidence scores
+3. The script checks whether any part of each bounding box overlaps a configured zone polygon (using OpenCV's `pointPolygonTest`)
+4. If a detection passes the zone check and the cooldown has expired for that camera/zone/class combination, a webhook is POSTed to Home Assistant
+5. HA waits briefly, grabs a high-res snapshot via ffmpeg, and sends a notification with the image
 
 ## Performance
 
-With this setup on Metis Compute Board (single Metis AIPU):
-- 2 cameras @ 1080p
-- YOLOv26s model
-- ~30 FPS combined throughput
-- ~196ms latency
-- Low CPU usage (AI offloaded to Metis AIPU)
+On a Metis Compute Board with two 1080p RTSP cameras:
 
-## Community & Support
+- ~30 FPS combined across both streams
+- ~196ms average latency
+- Metis temps: 31-32C
+- Detection to phone notification: 2-3 seconds
 
-For questions, issues, or to share your setup:
-- Axelera AI Community: https://community.axelera.ai
-- Voyager SDK Documentation: https://github.com/axelera-ai-hub/voyager-sdk
+## Configuration reference
 
-## License
+All settings live in `config.json`. The script falls back to sensible defaults if any are missing.
 
-Based on Axelera AI Voyager SDK examples. Check Voyager SDK license for usage terms.
+| Setting | Default | What it does |
+|---------|---------|-------------|
+| `alerts.cooldown_seconds` | 15.0 | Minimum seconds between alerts for the same camera/zone/class |
+| `alerts.parking_duration_seconds` | 4.0 | How long a car must be stationary in the blue zone before alerting |
+| `alerts.parking_movement_threshold` | 30.0 | Pixel distance a car can jitter and still count as stationary |
+| `model` | yolo26s-coco-onnx | Voyager SDK model name |
+| `aipu_cores` | 4 | Number of Metis AIPU cores to use |
+| `rtsp_reconnect_delay` | 5 | Seconds to wait before reconnecting after a stream failure |
+| `rtsp_max_reconnects` | 50 | Maximum reconnection attempts before the script exits |
+| `heartbeat_interval` | 60 | Seconds between heartbeat webhooks to HA |
+
+## Contributing
+
+If you build something similar or improve on this, I would love to see it. Fork away, open issues, or come share on the [Axelera AI community](https://community.axelera.ai).
