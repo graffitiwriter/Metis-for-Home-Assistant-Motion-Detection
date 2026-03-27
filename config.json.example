@@ -1,0 +1,44 @@
+{
+    "home_assistant": {
+        "ip": "YOUR_HA_IP",
+        "port": 8123,
+        "webhooks": {
+            "front": "metis_front_door",
+            "back": "metis_back_door"
+        }
+    },
+    "cameras": {
+        "front": {
+            "url": "rtsp://USERNAME:PASSWORD@CAMERA_IP:554/your/stream/path",
+            "detect_classes": ["person", "cat", "dog", "car"],
+            "confidence": 0.5
+        },
+        "back": {
+            "url": "rtsp://USERNAME:PASSWORD@CAMERA_IP:554/your/stream/path",
+            "detect_classes": ["person", "cat", "dog"],
+            "confidence": 0.5
+        }
+    },
+    "zones": {
+        "front_red": [
+            [0, 486], [385, 447], [1660, 447],
+            [1920, 465], [1920, 1080], [0, 1080]
+        ],
+        "front_blue": [
+            [282, 371], [1920, 371], [1920, 421], [282, 421]
+        ]
+    },
+    "alerts": {
+        "cooldown_seconds": 15.0,
+        "parking_duration_seconds": 4.0,
+        "parking_movement_threshold": 30.0
+    },
+    "model": "yolo26s-coco-onnx",
+    "aipu_cores": 4,
+    "rtsp_reconnect_delay": 5,
+    "rtsp_max_reconnects": 50,
+    "heartbeat_interval": 60,
+    "log_file": "/home/ubuntu/shared/detector.log",
+    "log_max_bytes": 5242880,
+    "log_backup_count": 3
+}
